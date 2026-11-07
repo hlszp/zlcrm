@@ -12,6 +12,7 @@ from flask import Flask, request, jsonify, session, g, send_from_directory, send
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from finance import balance_totals, contract_balances
+from process import validate_parameters, validate_steps
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -252,6 +253,28 @@ def migrate_v10(con):
     con.commit()
 
 
+def migrate_v11(con):
+    sql = con.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").fetchone()[0]
+    if "'engineer'" not in sql:
+        con.executescript("""
+        CREATE TABLE users_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          username TEXT NOT NULL UNIQUE,
+          password_hash TEXT NOT NULL,
+          name TEXT NOT NULL,
+          role TEXT NOT NULL CHECK(role IN ('admin','sales','finance','manager','engineer')),
+          active INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+        );
+        INSERT INTO users_new(id,username,password_hash,name,role,active,created_at)
+          SELECT id,username,password_hash,name,role,active,created_at FROM users;
+        DROP TABLE users;
+        ALTER TABLE users_new RENAME TO users;
+        """)
+    con.commit()
+
+
 def seed_dicts(con):
     for code, (name, labels) in DICT_SEED.items():
         con.execute("INSERT OR IGNORE INTO dict_types(code,name,builtin) VALUES(?,?,1)", (code, name))
@@ -274,6 +297,7 @@ def init_db():
     migrate_v8(con)
     migrate_v9(con)
     migrate_v10(con)
+    migrate_v11(con)
     seed_dicts(con)
     if con.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
         admin_password = os.environ.get("CRM_ADMIN_PASSWORD")
@@ -504,7 +528,7 @@ def list_users():
 @admin_required
 def create_user():
     d = body()
-    if d.get("role") not in ("admin", "sales", "finance", "manager"):
+    if d.get("role") not in ("admin", "sales", "finance", "manager", "engineer"):
         return jsonify({"error": "角色无效"}), 400
     if not d.get("username") or len(d.get("password", "")) < 6:
         return jsonify({"error": "用户名必填，密码至少 6 位"}), 400
@@ -536,7 +560,7 @@ def update_user(uid):
         db.execute("UPDATE users SET active=? WHERE id=?", (1 if d["active"] else 0, uid))
     if d.get("name"):
         db.execute("UPDATE users SET name=? WHERE id=?", (d["name"], uid))
-    if d.get("role") in ("admin", "sales", "finance", "manager"):
+    if d.get("role") in ("admin", "sales", "finance", "manager", "engineer"):
         db.execute("UPDATE users SET role=? WHERE id=?", (d["role"], uid))
     db.commit()
     return jsonify({"ok": True})
@@ -1748,6 +1772,8 @@ def next_document_no(db, kind, prefix, width):
         "furnace": ("furnace_batches", "furnace_no"),
         "acceptance": ("acceptance_records", "record_no"),
         "reconciliation": ("reconciliations", "statement_no"),
+        "process_run": ("process_runs", "run_no"),
+        "process_improvement": ("process_improvements", "code"),
     }[kind]
     key = f"{kind}:{prefix}"
     db.execute(
@@ -2422,6 +2448,844 @@ def update_equipment(eid):
                (name, hours, active, d.get("remark", before["remark"]), eid))
     after = row(db.execute("SELECT * FROM equipment WHERE id=?", (eid,)))
     write_audit(db, "equipment", eid, "update", before, after)
+    db.commit()
+    return jsonify({"ok": True})
+
+
+# ---------------- 工艺配方与版本 ----------------
+def process_version_view(v):
+    content = json.loads(v["content_json"])
+    item = dict(v, **content)
+    item.pop("content_json", None)
+    return item
+
+
+def process_version_for_write(db, vid, allow_admin=True):
+    v = row(db.execute(
+        """SELECT prv.*, pr.is_demo, pr.code AS recipe_code FROM process_recipe_versions prv
+           JOIN process_recipes pr ON pr.id=prv.recipe_id WHERE prv.id=?""", (vid,)))
+    if not v or not record_in_data_mode(v["is_demo"]):
+        return None
+    if not allow_admin and g.user["role"] != "admin":
+        return None
+    return v
+
+
+@app.get("/api/process/recipes")
+@login_required
+def list_process_recipes():
+    demo, params = demo_sql("pr")
+    data = rows(get_db().execute(f"""
+      SELECT pr.*, u.name AS created_by_name, prv.version_no AS current_version_no,
+        prv.status AS current_version_status, prv.content_json AS current_content
+      FROM process_recipes pr LEFT JOIN users u ON u.id=pr.created_by
+      LEFT JOIN process_recipe_versions prv ON prv.id=pr.current_version_id
+      WHERE 1=1 {demo} ORDER BY pr.id DESC""", params))
+    for item in data:
+        content = item.pop("current_content", None)
+        item["current_version"] = None
+        if item["current_version_id"]:
+            parsed = json.loads(content)
+            item["current_version"] = {"id": item["current_version_id"],
+                "version_no": item["current_version_no"], "status": item["current_version_status"],
+                "parameters": parsed.get("parameters", []), "steps": parsed.get("steps", [])}
+        item.pop("current_version_no", None)
+        item.pop("current_version_status", None)
+    return jsonify(data)
+
+
+@app.post("/api/process/recipes")
+@roles_required("admin", "engineer")
+def create_process_recipe():
+    d = body()
+    code = (d.get("code") or "").strip().upper()
+    name = (d.get("name") or "").strip()
+    coating = (d.get("coating_process") or "").strip()
+    if not code or not name or not coating:
+        return jsonify({"error": "配方编码、名称和镀膜工艺必填"}), 400
+    parameters = validate_parameters(d.get("parameters"))
+    steps = validate_steps(d.get("steps"))
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        cur = db.execute(
+            """INSERT INTO process_recipes(code,name,coating_process,applicable_material,part_category,
+               equipment_code,remark,is_demo,created_by) VALUES(?,?,?,?,?,?,?,?,?)""",
+            (code, name, coating, d.get("applicable_material", ""), d.get("part_category", ""),
+             d.get("equipment_code", ""), d.get("remark", ""),
+             1 if current_data_mode() == "demo" else 0, g.user["id"]))
+        recipe_id = cur.lastrowid
+        content = json.dumps({"parameters": parameters, "steps": steps}, ensure_ascii=False)
+        version_no = (d.get("version_no") or "V1.0").strip()
+        cur = db.execute(
+            """INSERT INTO process_recipe_versions(recipe_id,version_no,content_json,change_reason,created_by)
+               VALUES(?,?,?,?,?)""",
+            (recipe_id, version_no, content, d.get("change_reason") or "初始工艺版本", g.user["id"]))
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "配方编码或初始版本已存在"}), 400
+    version_id = cur.lastrowid
+    write_audit(db, "process_recipe", recipe_id, "create", None,
+                {"code": code, "name": name, "version_id": version_id})
+    db.commit()
+    return jsonify({"id": recipe_id, "version_id": version_id}), 201
+
+
+@app.get("/api/process/recipes/<int:rid>/versions")
+@login_required
+def list_process_versions(rid):
+    db = get_db()
+    recipe = row(db.execute("SELECT is_demo FROM process_recipes WHERE id=?", (rid,)))
+    if not recipe or not record_in_data_mode(recipe["is_demo"]):
+        return jsonify({"error": "配方不存在或不在当前数据范围"}), 404
+    data = rows(db.execute(
+        """SELECT prv.*, u.name AS created_by_name, r.name AS reviewed_by_name
+           FROM process_recipe_versions prv LEFT JOIN users u ON u.id=prv.created_by
+           LEFT JOIN users r ON r.id=prv.reviewed_by WHERE prv.recipe_id=? ORDER BY prv.id DESC""", (rid,)))
+    return jsonify([process_version_view(v) for v in data])
+
+
+@app.post("/api/process/recipes/<int:rid>/versions")
+@roles_required("admin", "engineer")
+def create_process_version(rid):
+    d = body()
+    version_no = (d.get("version_no") or "").strip()
+    reason = (d.get("change_reason") or "").strip()
+    if not version_no or not reason:
+        return jsonify({"error": "版本号和变更原因必填"}), 400
+    db = get_db()
+    recipe = row(db.execute("SELECT * FROM process_recipes WHERE id=?", (rid,)))
+    if not recipe or not record_in_data_mode(recipe["is_demo"]):
+        return jsonify({"error": "配方不存在或不在当前数据范围"}), 404
+    base = row(db.execute(
+        "SELECT * FROM process_recipe_versions WHERE recipe_id=? ORDER BY id DESC LIMIT 1", (rid,)))
+    content = json.loads(base["content_json"]) if base else {"parameters": [], "steps": []}
+    parameters = validate_parameters(d.get("parameters", content.get("parameters")))
+    steps = validate_steps(d.get("steps", content.get("steps")))
+    content = json.dumps({"parameters": parameters, "steps": steps}, ensure_ascii=False)
+    try:
+        cur = db.execute(
+            """INSERT INTO process_recipe_versions(recipe_id,version_no,content_json,change_reason,created_by)
+               VALUES(?,?,?,?,?)""", (rid, version_no, content, reason, g.user["id"]))
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "该版本号已存在"}), 400
+    write_audit(db, "process_recipe_version", cur.lastrowid, "create", None,
+                {"recipe_id": rid, "version_no": version_no, "change_reason": reason})
+    db.commit()
+    return jsonify({"id": cur.lastrowid}), 201
+
+
+@app.put("/api/process/recipe-versions/<int:vid>")
+@roles_required("admin", "engineer")
+def update_process_version(vid):
+    d = body()
+    db = get_db()
+    before = process_version_for_write(db, vid)
+    if not before:
+        return jsonify({"error": "版本不存在或不在当前数据范围"}), 404
+    if before["status"] != "草稿":
+        return jsonify({"error": "只有草稿版本可以编辑，请创建新版本"}), 400
+    content = json.loads(before["content_json"])
+    parameters = validate_parameters(d.get("parameters", content.get("parameters")))
+    steps = validate_steps(d.get("steps", content.get("steps")))
+    reason = (d.get("change_reason") or before["change_reason"]).strip()
+    content = json.dumps({"parameters": parameters, "steps": steps}, ensure_ascii=False)
+    db.execute("UPDATE process_recipe_versions SET content_json=?,change_reason=? WHERE id=?",
+               (content, reason, vid))
+    after = row(db.execute("SELECT * FROM process_recipe_versions WHERE id=?", (vid,)))
+    write_audit(db, "process_recipe_version", vid, "update", before, after, reason)
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/process/recipe-versions/<int:vid>/submit")
+@roles_required("admin", "engineer")
+def submit_process_version(vid):
+    db = get_db()
+    before = process_version_for_write(db, vid)
+    if not before:
+        return jsonify({"error": "版本不存在或不在当前数据范围"}), 404
+    if before["status"] != "草稿":
+        return jsonify({"error": "只有草稿可以提交审核"}), 400
+    db.execute("UPDATE process_recipe_versions SET status='待审核' WHERE id=?", (vid,))
+    after = row(db.execute("SELECT * FROM process_recipe_versions WHERE id=?", (vid,)))
+    write_audit(db, "process_recipe_version", vid, "submit", before, after)
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/process/recipe-versions/<int:vid>/publish")
+@admin_required
+def publish_process_version(vid):
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    before = process_version_for_write(db, vid)
+    if not before:
+        return jsonify({"error": "版本不存在或不在当前数据范围"}), 404
+    if before["status"] != "待审核":
+        return jsonify({"error": "只有待审核版本可以发布"}), 400
+    db.execute("UPDATE process_recipe_versions SET status='已停用' WHERE recipe_id=? AND status='已发布'",
+               (before["recipe_id"],))
+    reviewed_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    db.execute("""UPDATE process_recipe_versions
+                  SET status='已发布',reviewed_by=?,reviewed_at=? WHERE id=?""",
+               (g.user["id"], reviewed_at, vid))
+    db.execute("UPDATE process_recipes SET current_version_id=? WHERE id=?",
+               (vid, before["recipe_id"]))
+    after = row(db.execute("SELECT * FROM process_recipe_versions WHERE id=?", (vid,)))
+    write_audit(db, "process_recipe_version", vid, "publish", before, after)
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.get("/api/process/parameters")
+@login_required
+def list_process_parameter_defs():
+    return jsonify(rows(get_db().execute(
+        "SELECT * FROM process_parameter_defs WHERE active=1 ORDER BY sort,id")))
+
+
+@app.post("/api/process/parameters")
+@roles_required("admin", "engineer")
+def create_process_parameter_def():
+    d = body()
+    try:
+        item = validate_parameters([d])[0]
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    db = get_db()
+    try:
+        cur = db.execute(
+            """INSERT INTO process_parameter_defs(code,name,stage,value_type,unit,required,sort)
+               VALUES(?,?,?,?,?,?,?)""",
+            (item["code"], item["name"], item["stage"], item["value_type"], item["unit"],
+             1 if item["required"] else 0, int(d.get("sort") or 0)))
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "参数编码已存在"}), 400
+    write_audit(db, "process_parameter", cur.lastrowid, "create", None, item)
+    db.commit()
+    return jsonify({"id": cur.lastrowid}), 201
+
+
+# ---------------- 工艺执行批次 ----------------
+def process_run_for_access(db, rid):
+    run = row(db.execute("SELECT * FROM process_runs WHERE id=?", (rid,)))
+    if not run or not owns_contract(run["contract_id"]):
+        return None
+    return run
+
+
+@app.post("/api/process/runs")
+@roles_required("admin", "manager", "engineer")
+def create_process_run():
+    d = body()
+    fid = int(d.get("furnace_batch_id") or 0)
+    vid = int(d.get("recipe_version_id") or 0)
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    furnace = row(db.execute("SELECT * FROM furnace_batches WHERE id=?", (fid,)))
+    if not furnace:
+        return jsonify({"error": "炉次不存在"}), 404
+    if not owns_contract(furnace["contract_id"]):
+        return jsonify({"error": "无权为该炉次创建工艺记录"}), 403
+    version = row(db.execute("SELECT * FROM process_recipe_versions WHERE id=?", (vid,)))
+    if not version or version["status"] != "已发布":
+        return jsonify({"error": "只能使用已发布的工艺版本"}), 400
+    recipe = row(db.execute("SELECT * FROM process_recipes WHERE id=?", (version["recipe_id"],)))
+    if not recipe or recipe["current_version_id"] != vid:
+        return jsonify({"error": "新版本执行必须使用配方当前发布版本"}), 400
+    contract = row(db.execute("SELECT is_demo FROM contracts WHERE id=?", (furnace["contract_id"],)))
+    if recipe["is_demo"] != contract["is_demo"]:
+        return jsonify({"error": "工艺配方与炉次的数据范围不一致"}), 400
+    if db.execute("SELECT 1 FROM process_runs WHERE furnace_batch_id=? AND status!='已作废'", (fid,)).fetchone():
+        return jsonify({"error": "该炉次已有执行中的工艺记录"}), 400
+    run_no = next_document_no(db, "process_run", "GY-" + today().replace("-", "") + "-", 3)
+    try:
+        cur = db.execute(
+            """INSERT INTO process_runs(run_no,recipe_id,recipe_version_id,batch_id,furnace_batch_id,
+               contract_id,snapshot_json,operator_id,started_at,finished_at,remark,created_by)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (run_no, recipe["id"], vid, furnace["batch_id"], fid, furnace["contract_id"],
+             version["content_json"], g.user["id"], furnace["started_at"], furnace["finished_at"],
+             d.get("remark", ""), g.user["id"]))
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "该炉次已有工艺记录"}), 400
+    rid = cur.lastrowid
+    content = json.loads(version["content_json"])
+    for p in content.get("parameters", []):
+        db.execute(
+            """INSERT INTO process_run_values(run_id,parameter_code,parameter_name,stage,value_type,
+               unit,target_value,min_value,max_value) VALUES(?,?,?,?,?,?,?,?,?)""",
+            (rid, p["code"], p["name"], p["stage"], p["value_type"], p["unit"],
+             "" if p.get("target") is None else str(p["target"]), p.get("min"), p.get("max")))
+    write_audit(db, "process_run", rid, "create", None,
+                {"run_no": run_no, "furnace_batch_id": fid, "recipe_version_id": vid})
+    db.commit()
+    return jsonify({"id": rid, "run_no": run_no}), 201
+
+
+@app.get("/api/process/runs")
+@login_required
+def list_process_runs():
+    scope, params = scope_sql("ct")
+    return jsonify(rows(get_db().execute(f"""
+      SELECT run.*, recipe.code AS recipe_code, recipe.name AS recipe_name, prv.version_no,
+        fb.furnace_no, mb.batch_no, mb.item_name, c.name AS customer_name, ct.contract_no,
+        u.name AS operator_name,
+        COALESCE((SELECT COUNT(*) FROM process_run_values v WHERE v.run_id=run.id AND v.status='异常'),0) AS abnormal_values,
+        COALESCE((SELECT COUNT(*) FROM process_run_values v WHERE v.run_id=run.id AND v.status='缺失'),0) AS missing_values
+      FROM process_runs run JOIN process_recipes recipe ON recipe.id=run.recipe_id
+      JOIN process_recipe_versions prv ON prv.id=run.recipe_version_id
+      JOIN furnace_batches fb ON fb.id=run.furnace_batch_id
+      JOIN material_batches mb ON mb.id=run.batch_id
+      JOIN contracts ct ON ct.id=run.contract_id JOIN customers c ON c.id=ct.customer_id
+      LEFT JOIN users u ON u.id=run.operator_id
+      WHERE 1=1 {scope} ORDER BY run.id DESC LIMIT 500""", params)))
+
+
+@app.get("/api/process/runs/<int:rid>")
+@login_required
+def process_run_detail(rid):
+    db = get_db()
+    run = process_run_for_access(db, rid)
+    if not run:
+        return jsonify({"error": "执行批次不存在或无权访问"}), 404
+    item = dict(run)
+    item["snapshot"] = json.loads(item.pop("snapshot_json"))
+    item["values"] = rows(db.execute(
+        "SELECT * FROM process_run_values WHERE run_id=? ORDER BY id", (rid,)))
+    item["events"] = rows(db.execute(
+        """SELECT pe.*, u.name AS created_by_name FROM process_events pe
+           LEFT JOIN users u ON u.id=pe.created_by WHERE pe.run_id=? ORDER BY pe.event_time DESC,pe.id DESC""", (rid,)))
+    item["attachments"] = rows(db.execute(
+        """SELECT pa.id,pa.orig_name,pa.size,pa.created_at,u.name AS uploaded_by_name
+           FROM process_attachments pa LEFT JOIN users u ON u.id=pa.uploaded_by
+           WHERE pa.run_id=? ORDER BY pa.id DESC""", (rid,)))
+    return jsonify(item)
+
+
+@app.put("/api/process/runs/<int:rid>/values")
+@roles_required("admin", "manager", "engineer")
+def update_process_values(rid):
+    d = body()
+    values = d.get("values")
+    if not isinstance(values, list) or not values:
+        return jsonify({"error": "参数实测值不能为空"}), 400
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    run = process_run_for_access(db, rid)
+    if not run:
+        return jsonify({"error": "执行批次不存在或无权操作"}), 404
+    if run["status"] not in ("草稿", "已审核"):
+        return jsonify({"error": "当前状态不能修改参数"}), 400
+    if run["status"] == "已审核" and g.user["role"] == "manager":
+        return jsonify({"error": "已审核记录只能由工艺工程师或管理员修订"}), 403
+    before_values = rows(db.execute("SELECT * FROM process_run_values WHERE run_id=? ORDER BY id", (rid,)))
+    recorded_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for item in values:
+        value = row(db.execute("SELECT * FROM process_run_values WHERE id=? AND run_id=?",
+                               (int(item.get("id") or 0), rid)))
+        if not value:
+            return jsonify({"error": "参数不属于该执行批次"}), 400
+        actual = item.get("actual")
+        actual_numeric = None
+        actual_text = ""
+        if actual not in (None, ""):
+            if value["value_type"] == "number":
+                actual_numeric = number(actual, f"参数 {value['parameter_code']} 实测值")
+            else:
+                actual_text = str(actual)
+        status = item.get("status") or "正常"
+        if status not in ("正常", "异常", "缺失", "估读"):
+            return jsonify({"error": "参数状态无效"}), 400
+        if actual in (None, ""):
+            status = "缺失"
+        elif value["value_type"] == "number" and ((value["min_value"] is not None and actual_numeric < value["min_value"]) or
+                                                  (value["max_value"] is not None and actual_numeric > value["max_value"])):
+            status = "异常"
+        db.execute(
+            """UPDATE process_run_values SET actual_numeric=?,actual_text=?,status=?,recorded_at=?,recorded_by=?
+               WHERE id=?""",
+            (actual_numeric, actual_text, status, recorded_at, g.user["id"], value["id"]))
+    db.execute("UPDATE process_runs SET updated_at=? WHERE id=?", (recorded_at, rid))
+    after_values = rows(db.execute("SELECT * FROM process_run_values WHERE run_id=? ORDER BY id", (rid,)))
+    write_audit(db, "process_run", rid, "update_values", before_values, after_values, d.get("reason", ""))
+    db.commit()
+    return jsonify({"ok": True, "abnormal": sum(v["status"] == "异常" for v in after_values)})
+
+
+@app.post("/api/process/runs/<int:rid>/submit")
+@roles_required("admin", "manager", "engineer")
+def submit_process_run(rid):
+    db = get_db()
+    run = process_run_for_access(db, rid)
+    if not run:
+        return jsonify({"error": "执行批次不存在或无权操作"}), 404
+    if run["status"] != "草稿":
+        return jsonify({"error": "只有草稿可以提交审核"}), 400
+    snapshot = json.loads(run["snapshot_json"])
+    required = {p["code"] for p in snapshot.get("parameters", []) if p.get("required")}
+    if required:
+        placeholders = ",".join("?" * len(required))
+        missing = db.execute(
+            f"""SELECT COUNT(*) FROM process_run_values WHERE run_id=? AND status='缺失'
+                AND parameter_code IN ({placeholders})""", [rid] + list(required)).fetchone()[0]
+        if missing:
+            return jsonify({"error": "仍有必填参数缺失，不能提交审核"}), 400
+    submitted_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    db.execute("UPDATE process_runs SET status='待审核',submitted_at=?,updated_at=? WHERE id=?",
+               (submitted_at, submitted_at, rid))
+    after = row(db.execute("SELECT * FROM process_runs WHERE id=?", (rid,)))
+    write_audit(db, "process_run", rid, "submit", run, after)
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/process/runs/<int:rid>/review")
+@roles_required("admin", "engineer")
+def review_process_run(rid):
+    db = get_db()
+    run = process_run_for_access(db, rid)
+    if not run:
+        return jsonify({"error": "执行批次不存在或无权操作"}), 404
+    if run["status"] != "待审核":
+        return jsonify({"error": "只有待审核记录可以审核"}), 400
+    reviewed_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    db.execute("UPDATE process_runs SET status='已审核',reviewer_id=?,reviewed_at=?,updated_at=? WHERE id=?",
+               (g.user["id"], reviewed_at, reviewed_at, rid))
+    after = row(db.execute("SELECT * FROM process_runs WHERE id=?", (rid,)))
+    write_audit(db, "process_run", rid, "review", run, after)
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/process/runs/<int:rid>/void")
+@roles_required("admin", "engineer")
+def void_process_run(rid):
+    d = body()
+    if not (d.get("reason") or "").strip():
+        return jsonify({"error": "作废原因必填"}), 400
+    db = get_db()
+    run = process_run_for_access(db, rid)
+    if not run:
+        return jsonify({"error": "执行批次不存在或无权操作"}), 404
+    if run["status"] == "已作废":
+        return jsonify({"error": "该记录已作废"}), 400
+    db.execute("UPDATE process_runs SET status='已作废',updated_at=? WHERE id=?",
+               (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), rid))
+    after = row(db.execute("SELECT * FROM process_runs WHERE id=?", (rid,)))
+    write_audit(db, "process_run", rid, "void", run, after, d["reason"])
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/process/runs/<int:rid>/events")
+@roles_required("admin", "manager", "engineer")
+def create_process_event(rid):
+    d = body()
+    event_type = (d.get("event_type") or "").strip()
+    description = (d.get("description") or "").strip()
+    allowed_types = ("工序开始", "工序结束", "参数调整", "停机", "返工", "异常处理", "其他")
+    if event_type not in allowed_types or not description:
+        return jsonify({"error": "事件类型和事件说明必填"}), 400
+    try:
+        event_time = datetime.datetime.fromisoformat(
+            (d.get("event_time") or "").strip().replace("T", " ")
+        ).strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return jsonify({"error": "事件时间格式无效"}), 400
+    db = get_db()
+    run = process_run_for_access(db, rid)
+    if not run:
+        return jsonify({"error": "执行批次不存在或无权操作"}), 404
+    if run["status"] == "已作废":
+        return jsonify({"error": "已作废记录不能新增事件"}), 400
+    cur = db.execute(
+        "INSERT INTO process_events(run_id,event_type,event_time,description,reason,created_by) VALUES(?,?,?,?,?,?)",
+        (rid, event_type, event_time, description, (d.get("reason") or "").strip(), g.user["id"]))
+    updated_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    db.execute("UPDATE process_runs SET updated_at=? WHERE id=?", (updated_at, rid))
+    write_audit(db, "process_run", rid, "add_event", None,
+                {"id": cur.lastrowid, "event_type": event_type, "event_time": event_time,
+                 "description": description, "reason": (d.get("reason") or "").strip()})
+    db.commit()
+    return jsonify({"id": cur.lastrowid}), 201
+
+
+PROCESS_ATTACHMENT_EXTS = PREVIEW_EXTS | {".csv", ".xls", ".xlsx"}
+
+
+@app.post("/api/process/runs/<int:rid>/attachments")
+@roles_required("admin", "manager", "engineer")
+def upload_process_attachment(rid):
+    db = get_db()
+    run = process_run_for_access(db, rid)
+    if not run:
+        return jsonify({"error": "执行批次不存在或无权操作"}), 404
+    if run["status"] == "已作废":
+        return jsonify({"error": "已作废记录不能上传附件"}), 400
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return jsonify({"error": "请选择文件"}), 400
+    orig = f.filename
+    if os.path.splitext(orig)[1].lower() not in PROCESS_ATTACHMENT_EXTS:
+        return jsonify({"error": "仅支持 PDF、图片、文本、CSV 或 Excel 附件，不支持 SVG/HTML"}), 400
+    fname = (f"process_{rid}_{int(datetime.datetime.now().timestamp() * 1000)}_"
+             f"{secrets.token_hex(8)}_{secure_filename(orig) or 'evidence'}")
+    f.save(os.path.join(UPLOAD_DIR, fname))
+    size = os.path.getsize(os.path.join(UPLOAD_DIR, fname))
+    cur = db.execute(
+        "INSERT INTO process_attachments(run_id,filename,orig_name,size,uploaded_by) VALUES(?,?,?,?,?)",
+        (rid, fname, orig, size, g.user["id"]))
+    write_audit(db, "process_run", rid, "add_attachment", None,
+                {"id": cur.lastrowid, "orig_name": orig, "size": size})
+    db.commit()
+    return jsonify({"id": cur.lastrowid, "orig_name": orig, "size": size}), 201
+
+
+@app.get("/api/process/attachments/<int:aid>")
+@login_required
+def serve_process_attachment(aid):
+    db = get_db()
+    attachment = row(db.execute("SELECT * FROM process_attachments WHERE id=?", (aid,)))
+    if not attachment or not process_run_for_access(db, attachment["run_id"]):
+        return jsonify({"error": "附件不存在或无权访问"}), 404
+    ext = os.path.splitext(attachment["orig_name"])[1].lower()
+    response = send_from_directory(
+        UPLOAD_DIR, attachment["filename"], as_attachment=request.args.get("dl") == "1" or ext not in PREVIEW_EXTS,
+        download_name=attachment["orig_name"])
+    response.headers["Content-Security-Policy"] = "sandbox; default-src 'none'"
+    return response
+
+
+@app.get("/api/process/monitor")
+@login_required
+def process_monitor():
+    scope, params = scope_sql("ct")
+    data = rows(get_db().execute(f"""
+      SELECT run.id,run.run_no,run.status,run.updated_at,recipe.name AS recipe_name,prv.version_no,
+        fb.furnace_no,mb.batch_no,mb.item_name,ct.contract_no,c.name AS customer_name,
+        COALESCE((SELECT COUNT(*) FROM process_run_values v WHERE v.run_id=run.id AND v.status='异常'),0) AS abnormal_values,
+        COALESCE((SELECT COUNT(*) FROM process_run_values v WHERE v.run_id=run.id AND v.status='缺失'),0) AS missing_values,
+        (SELECT GROUP_CONCAT(v.parameter_name || '：' || CAST(COALESCE(v.actual_numeric,v.actual_text) AS TEXT) || v.unit,'、')
+           FROM process_run_values v WHERE v.run_id=run.id AND v.status='异常') AS abnormal_parameters,
+        (SELECT GROUP_CONCAT(v.parameter_name,'、') FROM process_run_values v
+           WHERE v.run_id=run.id AND v.status='缺失') AS missing_parameters,
+        ROUND((julianday('now','localtime')-julianday(run.updated_at))*24,1) AS idle_hours
+      FROM process_runs run JOIN process_recipes recipe ON recipe.id=run.recipe_id
+      JOIN process_recipe_versions prv ON prv.id=run.recipe_version_id
+      JOIN furnace_batches fb ON fb.id=run.furnace_batch_id
+      JOIN material_batches mb ON mb.id=run.batch_id
+      JOIN contracts ct ON ct.id=run.contract_id JOIN customers c ON c.id=ct.customer_id
+      WHERE run.status!='已作废' {scope} ORDER BY run.updated_at ASC""", params))
+    abnormal = [x for x in data if x["abnormal_values"]]
+    missing = [x for x in data if x["missing_values"]]
+    stale = [x for x in data if x["status"] in ("草稿", "待审核") and x["idle_hours"] >= 24]
+    return jsonify({
+        "summary": {"active_runs": sum(x["status"] in ("草稿", "待审核") for x in data),
+                    "abnormal_runs": len(abnormal), "missing_runs": len(missing),
+                    "pending_review": sum(x["status"] == "待审核" for x in data),
+                    "stale_runs": len(stale)},
+        "abnormal": abnormal, "missing": missing, "stale": stale,
+        "note": "仅反映人工录入的参数偏差和记录时效，不代表设备实时状态。",
+    })
+
+
+# ---------------- 工艺分析与改进 ----------------
+def process_run_metrics(db, run_ids):
+    if not run_ids:
+        return {}
+    placeholders = ",".join("?" * len(run_ids))
+    data = rows(db.execute(f"""
+      SELECT run.id,run.run_no,run.recipe_id,run.recipe_version_id,run.contract_id,run.status,
+        run.started_at,run.finished_at,run.created_at,recipe.code AS recipe_code,recipe.name AS recipe_name,
+        prv.version_no,fb.furnace_no,mb.batch_no,mb.item_name,ct.contract_no,c.name AS customer_name,
+        COALESCE((SELECT COUNT(*) FROM process_run_values v WHERE v.run_id=run.id AND v.status='异常'),0) AS abnormal_values,
+        COALESCE((SELECT COUNT(*) FROM process_run_values v WHERE v.run_id=run.id AND v.status='缺失'),0) AS missing_values,
+        (SELECT COUNT(*) FROM quality_inspections q WHERE q.furnace_batch_id=run.furnace_batch_id) AS quality_count,
+        (SELECT COALESCE(SUM(q.inspected_qty),0) FROM quality_inspections q WHERE q.furnace_batch_id=run.furnace_batch_id) AS quality_inspected,
+        (SELECT COALESCE(SUM(q.pass_qty),0) FROM quality_inspections q WHERE q.furnace_batch_id=run.furnace_batch_id) AS quality_passed,
+        (SELECT COUNT(*) FROM cost_entries ce WHERE ce.furnace_batch_id=run.furnace_batch_id) AS cost_count,
+        (SELECT SUM(ce.amount) FROM cost_entries ce WHERE ce.furnace_batch_id=run.furnace_batch_id) AS cost,
+        CASE WHEN fb.started_at!='' AND fb.finished_at!=''
+          THEN ROUND((julianday(fb.finished_at)-julianday(fb.started_at))*24,2) END AS duration_hours
+      FROM process_runs run JOIN process_recipes recipe ON recipe.id=run.recipe_id
+      JOIN process_recipe_versions prv ON prv.id=run.recipe_version_id
+      JOIN furnace_batches fb ON fb.id=run.furnace_batch_id
+      JOIN material_batches mb ON mb.id=run.batch_id
+      JOIN contracts ct ON ct.id=run.contract_id JOIN customers c ON c.id=ct.customer_id
+      WHERE run.id IN ({placeholders}) ORDER BY run.created_at,run.id""", run_ids))
+    for item in data:
+        item["quality_rate"] = (round(item["quality_passed"] * 100 / item["quality_inspected"], 2)
+                                if item["quality_inspected"] else None)
+    return {item["id"]: item for item in data}
+
+
+def average(values):
+    values = [x for x in values if x is not None]
+    return round(sum(values) / len(values), 4) if values else None
+
+
+@app.get("/api/process/analysis")
+@login_required
+def process_analysis():
+    db = get_db()
+    recipe_id = int(request.args.get("recipe_id") or 0)
+    version_id = int(request.args.get("version_id") or 0)
+    recipe = row(db.execute("SELECT * FROM process_recipes WHERE id=?", (recipe_id,)))
+    if not recipe or not record_in_data_mode(recipe["is_demo"]):
+        return jsonify({"error": "配方不存在或不在当前数据范围"}), 404
+    conditions = ["run.recipe_id=?", "run.status!='已作废'"]
+    params = [recipe_id]
+    if version_id:
+        version = row(db.execute("SELECT id FROM process_recipe_versions WHERE id=? AND recipe_id=?",
+                                 (version_id, recipe_id)))
+        if not version:
+            return jsonify({"error": "版本不属于该配方"}), 400
+        conditions.append("run.recipe_version_id=?")
+        params.append(version_id)
+    scope, scope_params = scope_sql("ct")
+    run_ids = [r[0] for r in db.execute(f"""
+      SELECT run.id FROM process_runs run JOIN contracts ct ON ct.id=run.contract_id
+      WHERE {' AND '.join(conditions)} {scope} ORDER BY run.id""", params + scope_params)]
+    metrics = process_run_metrics(db, run_ids)
+    run_data = list(metrics.values())
+    values = []
+    if run_ids:
+        placeholders = ",".join("?" * len(run_ids))
+        values = rows(db.execute(f"""
+          SELECT v.*,run.run_no,run.recipe_version_id FROM process_run_values v
+          JOIN process_runs run ON run.id=v.run_id WHERE v.run_id IN ({placeholders})
+          ORDER BY run.created_at,run.id,v.id""", run_ids))
+    grouped = {}
+    for value in values:
+        group = grouped.setdefault(value["parameter_code"], {
+            "code": value["parameter_code"], "name": value["parameter_name"],
+            "unit": value["unit"], "stage": value["stage"], "numbers": [],
+            "missing": 0, "abnormal": 0, "estimated": 0, "trend": [],
+        })
+        group["missing"] += value["status"] == "缺失"
+        group["abnormal"] += value["status"] == "异常"
+        group["estimated"] += value["status"] == "估读"
+        if value["actual_numeric"] is not None:
+            group["numbers"].append(value["actual_numeric"])
+            group["trend"].append({"run_id": value["run_id"], "run_no": value["run_no"],
+                                   "version_id": value["recipe_version_id"],
+                                   "actual": value["actual_numeric"], "status": value["status"]})
+    parameters = []
+    for group in grouped.values():
+        numbers = group.pop("numbers")
+        avg = average(numbers)
+        group.update({"count": len(numbers), "avg": avg,
+                      "min": min(numbers) if numbers else None, "max": max(numbers) if numbers else None,
+                      "stddev": round(math.sqrt(sum((x - avg) ** 2 for x in numbers) / len(numbers)), 4)
+                      if numbers else None,
+                      "sample_note": "样本不足 3 个，仅作描述" if len(numbers) < 3 else "描述性统计，不构成自动寻优结论"})
+        parameters.append(group)
+    versions = {}
+    for run in run_data:
+        group = versions.setdefault(run["recipe_version_id"], {
+            "version_id": run["recipe_version_id"], "version_no": run["version_no"],
+            "run_count": 0, "reviewed_runs": 0, "abnormal_runs": 0,
+            "quality_inspected": 0, "quality_passed": 0, "costs": [], "durations": [],
+        })
+        group["run_count"] += 1
+        group["reviewed_runs"] += run["status"] == "已审核"
+        group["abnormal_runs"] += run["abnormal_values"] > 0
+        group["quality_inspected"] += run["quality_inspected"]
+        group["quality_passed"] += run["quality_passed"]
+        if run["cost"] is not None:
+            group["costs"].append(run["cost"])
+        if run["duration_hours"] is not None:
+            group["durations"].append(run["duration_hours"])
+    version_data = []
+    for group in versions.values():
+        costs = group.pop("costs"); durations = group.pop("durations")
+        group["quality_rate"] = (round(group["quality_passed"] * 100 / group["quality_inspected"], 2)
+                                 if group["quality_inspected"] else None)
+        group["avg_cost"] = average(costs); group["avg_duration_hours"] = average(durations)
+        version_data.append(group)
+    pareto = sorted(({"code": p["code"], "name": p["name"], "count": p["abnormal"]}
+                     for p in parameters if p["abnormal"]), key=lambda x: (-x["count"], x["code"]))
+    benchmarks = sorted((x for x in run_data if x["status"] == "已审核" and not x["abnormal_values"]
+                         and not x["missing_values"] and x["quality_rate"] == 100),
+                        key=lambda x: (x["cost"] if x["cost"] is not None else math.inf,
+                                       x["duration_hours"] if x["duration_hours"] is not None else math.inf))[:5]
+    return jsonify({"recipe": {"id": recipe["id"], "code": recipe["code"], "name": recipe["name"]},
+                    "summary": {"runs": len(run_data), "reviewed_runs": sum(x["status"] == "已审核" for x in run_data),
+                                "abnormal_runs": sum(x["abnormal_values"] > 0 for x in run_data),
+                                "quality_rate": round(sum(x["quality_passed"] for x in run_data) * 100 /
+                                                      sum(x["quality_inspected"] for x in run_data), 2)
+                                if sum(x["quality_inspected"] for x in run_data) else None},
+                    "runs": run_data, "versions": version_data, "parameters": parameters,
+                    "abnormal_pareto": pareto, "benchmark_candidates": benchmarks,
+                    "benchmark_note": "标杆候选须已审核、无缺失/异常且质量合格率为 100%；不代表自动寻优结论。"})
+
+
+@app.get("/api/process/compare")
+@login_required
+def compare_process_runs():
+    try:
+        run_ids = [int(x) for x in (request.args.get("run_ids") or "").split(",") if x]
+    except ValueError:
+        return jsonify({"error": "批次编号格式无效"}), 400
+    if len(run_ids) != 2 or len(set(run_ids)) != 2:
+        return jsonify({"error": "请选择两个不同的执行批次"}), 400
+    db = get_db()
+    runs = []
+    for rid in run_ids:
+        run = process_run_for_access(db, rid)
+        if not run or run["status"] == "已作废":
+            return jsonify({"error": "执行批次不存在、已作废或无权访问"}), 404
+        runs.append(run)
+    metrics = process_run_metrics(db, run_ids)
+    value_maps = []
+    codes = []
+    for rid in run_ids:
+        data = rows(db.execute("SELECT * FROM process_run_values WHERE run_id=? ORDER BY id", (rid,)))
+        value_maps.append({x["parameter_code"]: x for x in data})
+        codes.extend(x["parameter_code"] for x in data if x["parameter_code"] not in codes)
+    parameters = []
+    for code in codes:
+        left = value_maps[0].get(code); right = value_maps[1].get(code)
+        parameters.append({"code": code, "name": (left or right)["parameter_name"],
+                           "unit": (left or right)["unit"], "left": left, "right": right,
+                           "difference": right["actual_numeric"] - left["actual_numeric"]
+                           if left and right and left["actual_numeric"] is not None and right["actual_numeric"] is not None else None})
+    left, right = metrics[run_ids[0]], metrics[run_ids[1]]
+    delta = lambda key: right[key] - left[key] if left[key] is not None and right[key] is not None else None
+    return jsonify({"runs": [left, right], "parameters": parameters,
+                    "quality_delta": delta("quality_rate"), "cost_delta": delta("cost"),
+                    "duration_delta": delta("duration_hours")})
+
+
+def validate_process_improvement(db, d, current=None):
+    def value(key, default=None):
+        if key in d:
+            return d[key]
+        if current:
+            if key == "variables":
+                return json.loads(current["variables_json"])
+            if key in current:
+                return current[key]
+        return default
+    recipe_id = int(value("recipe_id", 0) or 0)
+    title = (value("title", "") or "").strip()
+    problem = (value("problem", "") or "").strip()
+    status = value("status", "草稿")
+    if not recipe_id or not title or not problem:
+        raise ValueError("改进主题、关联配方和问题描述必填")
+    if status not in ("草稿", "验证中", "已结案", "已取消"):
+        raise ValueError("改进专题状态无效")
+    conclusion = (value("conclusion", "") or "").strip()
+    if status == "已结案" and not conclusion:
+        raise ValueError("结案前必须填写结论")
+    recipe = row(db.execute("SELECT * FROM process_recipes WHERE id=?", (recipe_id,)))
+    if not recipe or not record_in_data_mode(recipe["is_demo"]):
+        raise ValueError("关联配方不存在或不在当前数据范围")
+    result = {"recipe_id": recipe_id, "title": title, "problem": problem,
+              "hypothesis": (value("hypothesis", "") or "").strip(), "conclusion": conclusion,
+              "status": status, "is_demo": recipe["is_demo"]}
+    linked = {}
+    for key in ("baseline_run_id", "candidate_run_id"):
+        rid = int(value(key, 0) or 0) or None
+        if rid:
+            run = process_run_for_access(db, rid)
+            if not run or run["status"] == "已作废" or run["recipe_id"] != recipe_id:
+                raise ValueError("对照批次必须属于该配方、未作废且在当前权限范围")
+        linked[key] = rid
+    if linked["baseline_run_id"] and linked["baseline_run_id"] == linked["candidate_run_id"]:
+        raise ValueError("基准批次和候选批次不能相同")
+    result.update(linked)
+    version_id = int(value("result_version_id", 0) or 0) or None
+    if version_id and not row(db.execute(
+            "SELECT id FROM process_recipe_versions WHERE id=? AND recipe_id=?", (version_id, recipe_id))):
+        raise ValueError("形成版本必须属于该配方")
+    result["result_version_id"] = version_id
+    variables = value("variables", [])
+    if not isinstance(variables, list):
+        raise ValueError("改进变量必须是数组")
+    result["variables"] = [str(x).strip() for x in variables if str(x).strip()]
+    return result
+
+
+def process_improvement_view(db, item):
+    result = dict(item)
+    result["variables"] = json.loads(result.pop("variables_json"))
+    ids = [x for x in (item["baseline_run_id"], item["candidate_run_id"]) if x]
+    metrics = process_run_metrics(db, ids)
+    baseline = metrics.get(item["baseline_run_id"]); candidate = metrics.get(item["candidate_run_id"])
+    result["baseline"] = baseline; result["candidate"] = candidate
+    result["quality_delta"] = (candidate["quality_rate"] - baseline["quality_rate"]
+                               if baseline and candidate and baseline["quality_rate"] is not None
+                               and candidate["quality_rate"] is not None else None)
+    result["cost_delta"] = (candidate["cost"] - baseline["cost"]
+                            if baseline and candidate and baseline["cost"] is not None
+                            and candidate["cost"] is not None else None)
+    return result
+
+
+@app.get("/api/process/improvements")
+@login_required
+def list_process_improvements():
+    db = get_db()
+    demo, params = demo_sql("pi")
+    data = rows(db.execute(f"""
+      SELECT pi.*,recipe.code AS recipe_code,recipe.name AS recipe_name,u.name AS created_by_name,
+        baseline.run_no AS baseline_run_no,candidate.run_no AS candidate_run_no,prv.version_no AS result_version_no
+      FROM process_improvements pi JOIN process_recipes recipe ON recipe.id=pi.recipe_id
+      LEFT JOIN users u ON u.id=pi.created_by LEFT JOIN process_runs baseline ON baseline.id=pi.baseline_run_id
+      LEFT JOIN process_runs candidate ON candidate.id=pi.candidate_run_id
+      LEFT JOIN process_recipe_versions prv ON prv.id=pi.result_version_id
+      WHERE 1=1 {demo} ORDER BY pi.id DESC LIMIT 200""", params))
+    if g.user["role"] == "sales":
+        data = [item for item in data
+                if [x for x in (item["baseline_run_id"], item["candidate_run_id"]) if x]
+                and all(process_run_for_access(db, x) for x in
+                        (item["baseline_run_id"], item["candidate_run_id"]) if x)]
+    return jsonify([process_improvement_view(db, x) for x in data])
+
+
+@app.post("/api/process/improvements")
+@roles_required("admin", "engineer")
+def create_process_improvement():
+    db = get_db()
+    item = validate_process_improvement(db, body())
+    db.execute("BEGIN IMMEDIATE")
+    code = next_document_no(db, "process_improvement", "GJ-" + today().replace("-", "") + "-", 3)
+    cur = db.execute("""
+      INSERT INTO process_improvements(code,title,recipe_id,problem,hypothesis,baseline_run_id,candidate_run_id,
+        result_version_id,variables_json,conclusion,status,is_demo,created_by,closed_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+      (code, item["title"], item["recipe_id"], item["problem"], item["hypothesis"],
+       item["baseline_run_id"], item["candidate_run_id"], item["result_version_id"],
+       json.dumps(item["variables"], ensure_ascii=False), item["conclusion"], item["status"],
+       item["is_demo"], g.user["id"], datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+       if item["status"] == "已结案" else ""))
+    write_audit(db, "process_improvement", cur.lastrowid, "create", None, {"code": code, **item})
+    db.commit()
+    return jsonify({"id": cur.lastrowid, "code": code}), 201
+
+
+@app.put("/api/process/improvements/<int:iid>")
+@roles_required("admin", "engineer")
+def update_process_improvement(iid):
+    db = get_db()
+    before = row(db.execute("SELECT * FROM process_improvements WHERE id=?", (iid,)))
+    if not before or not record_in_data_mode(before["is_demo"]):
+        return jsonify({"error": "改进专题不存在或不在当前数据范围"}), 404
+    if before["status"] in ("已结案", "已取消"):
+        return jsonify({"error": "已结案或已取消专题不可修改，请新建专题继续验证"}), 400
+    item = validate_process_improvement(db, body(), before)
+    updated_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    db.execute("""
+      UPDATE process_improvements SET title=?,recipe_id=?,problem=?,hypothesis=?,baseline_run_id=?,
+        candidate_run_id=?,result_version_id=?,variables_json=?,conclusion=?,status=?,is_demo=?,updated_at=?,
+        closed_at=CASE WHEN ?='已结案' THEN ? ELSE '' END WHERE id=?""",
+      (item["title"], item["recipe_id"], item["problem"], item["hypothesis"], item["baseline_run_id"],
+       item["candidate_run_id"], item["result_version_id"], json.dumps(item["variables"], ensure_ascii=False),
+       item["conclusion"], item["status"], item["is_demo"], updated_at, item["status"], updated_at, iid))
+    after = row(db.execute("SELECT * FROM process_improvements WHERE id=?", (iid,)))
+    write_audit(db, "process_improvement", iid, "update", before, after)
     db.commit()
     return jsonify({"ok": True})
 
@@ -3462,6 +4326,19 @@ def mobile_boss():
     plant = _call_stat(stats_view_plant)
     profit = _call_stat(stats_profitability)
     operations = _call_stat(stats_operations)
+    process = _call_stat(process_monitor)
+    db = get_db()
+    demo, demo_params = demo_sql("pi")
+    improvement_counts = row(db.execute(f"""
+      SELECT COALESCE(SUM(status='验证中'),0) AS active,
+        COALESCE(SUM(status='已结案'),0) AS closed
+      FROM process_improvements pi WHERE 1=1 {demo}""", demo_params))
+    improvements = rows(db.execute(f"""
+      SELECT pi.*,baseline.run_no AS baseline_run_no,candidate.run_no AS candidate_run_no
+      FROM process_improvements pi LEFT JOIN process_runs baseline ON baseline.id=pi.baseline_run_id
+      LEFT JOIN process_runs candidate ON candidate.id=pi.candidate_run_id
+      WHERE pi.status='已结案' {demo} ORDER BY pi.closed_at DESC,pi.id DESC LIMIT 5""", demo_params))
+    improvement_views = [process_improvement_view(db, x) for x in improvements]
     return jsonify({
         "month": boss["month"], "data_mode": current_data_mode(),
         "kpis": {
@@ -3486,6 +4363,11 @@ def mobile_boss():
         "future_by_month": boss["future_by_month"],
         "overdue_delivery": plant["overdue_delivery"],
         "customer_risks": [x for x in operations["customers"] if x["risk"] != "正常"][:10],
+        "process": {**process["summary"], "improvements_active": improvement_counts["active"],
+                    "improvements_closed": improvement_counts["closed"]},
+        "process_alerts": process["abnormal"][:5],
+        "process_improvements": [{k: x[k] for k in ("id", "code", "title", "conclusion", "baseline_run_no",
+            "candidate_run_no", "quality_delta", "cost_delta", "closed_at")} for x in improvement_views],
     })
 
 

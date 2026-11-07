@@ -43,6 +43,8 @@ function render(data) {
     metric('预估毛利', money(k.gross_profit), k.gross_profit < 0 ? 'danger' : 'good', k.margin_rate === null ? '暂无合同' : `毛利率 ${k.margin_rate}%`),
     metric('产能利用率', k.capacity_utilization === null ? '未配置工时' : `${k.capacity_utilization}%`, 'instrument'),
     metric('一次合格率', k.first_pass_rate === null ? '暂无质检' : `${k.first_pass_rate}%`),
+    metric('工艺异常 / 待审核', `${data.process.abnormal_runs} / ${data.process.pending_review}`, data.process.abnormal_runs ? 'danger' : '', `${data.process.stale_runs} 批超过 24 小时未更新`),
+    metric('改进验证 / 已结案', `${data.process.improvements_active} / ${data.process.improvements_closed}`, 'instrument'),
     metric('停接 / 关注客户', `${k.risk_counts['停接']} / ${k.risk_counts['关注']} 家`, k.risk_counts['停接'] ? 'danger' : '', `TOP5 集中度 ${k.top5_concentration}%`),
   ].join('');
   $('overdueCount').textContent = `${k.overdue_count} 笔`;
@@ -52,6 +54,8 @@ function render(data) {
   records('delivery', data.overdue_delivery, '当前没有交付逾期合同。', item => `<li class="record"><div><div class="record-title">${esc(item.customer)}</div><div class="record-meta">${esc(item.contract_no)} · ${esc(item.delivery_date)}</div></div><div class="record-value danger">${esc(item.status)}</div></li>`);
   $('customerRiskCount').textContent = `${data.customer_risks.length} 家`;
   records('customerRisks', data.customer_risks, '当前没有停接或关注客户。', item => `<li class="record"><div><div class="record-title">${esc(item.customer)}</div><div class="record-meta">${esc(item.risk)} · ${esc(item.reasons.join('；') || '无')}</div></div><div class="record-value danger">${money(item.outstanding)}</div></li>`);
+  records('processAlerts', data.process_alerts, '当前没有工艺参数异常。', item => `<li class="record"><div><div class="record-title">${esc(item.recipe_name)} · ${esc(item.version_no)}</div><div class="record-meta">${esc(item.run_no)} · ${esc(item.furnace_no)}<br>${esc(item.abnormal_parameters || '存在异常参数')}</div></div><div class="record-value danger">${item.abnormal_values} 项</div></li>`);
+  records('processImprovements', data.process_improvements, '暂无已结案的工艺改进。', item => `<li class="record"><div><div class="record-title">${esc(item.title)}</div><div class="record-meta">${esc(item.baseline_run_no || '-')} → ${esc(item.candidate_run_no || '-')}<br>${esc(item.conclusion)}</div></div><div class="record-value ${item.quality_delta < 0 ? 'danger' : 'good'}">${item.quality_delta === null ? '待对照' : `质量 ${item.quality_delta > 0 ? '+' : ''}${item.quality_delta}pp`}</div></li>`);
 }
 
 async function load() {

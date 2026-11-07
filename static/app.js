@@ -84,6 +84,7 @@ const ROUTES = {
   contracts: { title: '合同管理', render: renderContracts },
   shipments: { title: '发货管理', render: renderShipments },
   production: { title: '生产协同', render: renderProduction },
+  process:   { title: '工艺寻优', render: renderProcess },
   plans:     { title: '回款管理', render: renderPlans },
   invoices:  { title: '开票台账', render: renderInvoices },
   products:  { title: '产品管理', render: renderProducts },
@@ -1710,7 +1711,7 @@ async function renderTabPerf(pane) {
 async function renderAdmin(view) {
   if (ME.role !== 'admin') { view.innerHTML = '<div class="empty">仅管理员可访问</div>'; return; }
   const list = await get('/api/users');
-  const roleName = { admin: '老板/管理员', sales: '业务', finance: '财务', manager: '工厂经理' };
+  const roleName = { admin: '老板/管理员', sales: '业务', finance: '财务', manager: '工厂经理', engineer: '工艺工程师' };
   view.innerHTML = `
     <div class="toolbar"><button class="btn btn-primary" id="btnAdd">+ 新增账号</button></div>
     <div class="card table-wrap"><table>
@@ -1729,7 +1730,7 @@ async function renderAdmin(view) {
         <label>用户名 *<input name="username" required></label>
         <label>姓名<input name="name"></label>
         <label>初始密码 *（至少6位）<input name="password" required minlength="6"></label>
-        <label>角色<select name="role"><option value="sales">业务</option><option value="finance">财务</option><option value="manager">工厂经理</option><option value="admin">老板/管理员</option></select></label>
+        <label>角色<select name="role"><option value="sales">业务</option><option value="finance">财务</option><option value="manager">工厂经理</option><option value="engineer">工艺工程师</option><option value="admin">老板/管理员</option></select></label>
         <div class="form-actions full"><button type="button" class="btn" id="cancel">取消</button>
         <button class="btn btn-primary">创建</button></div>
       </form>`);
@@ -1794,7 +1795,7 @@ async function refreshBadge() {
   catch (e) { location.href = '/login.html'; return; }
   try { DICTS = await get('/api/dicts'); } catch (e) { DICTS = {}; }
   document.getElementById('app').style.display = 'flex';
-  document.getElementById('userInfo').textContent = `${ME.name}（${{ admin: '老板', sales: '业务', finance: '财务', manager: '工厂经理' }[ME.role]}）`;
+  document.getElementById('userInfo').textContent = `${ME.name}（${{ admin: '老板', sales: '业务', finance: '财务', manager: '工厂经理', engineer: '工艺工程师' }[ME.role]}）`;
   if (ME.role === 'admin') {
     document.getElementById('navAdmin').style.display = '';
     document.getElementById('navSettings').style.display = '';

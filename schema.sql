@@ -313,6 +313,131 @@ CREATE TABLE IF NOT EXISTS equipment (
   created_at            TEXT NOT NULL DEFAULT (datetime('now','localtime'))
 );
 
+CREATE TABLE IF NOT EXISTS process_recipes (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  code              TEXT NOT NULL UNIQUE,
+  name              TEXT NOT NULL,
+  coating_process   TEXT NOT NULL,
+  applicable_material TEXT DEFAULT '',
+  part_category     TEXT DEFAULT '',
+  equipment_code    TEXT DEFAULT '',
+  current_version_id INTEGER,
+  status            TEXT NOT NULL DEFAULT '启用' CHECK(status IN ('启用','停用')),
+  remark            TEXT DEFAULT '',
+  is_demo           INTEGER NOT NULL DEFAULT 0,
+  created_by        INTEGER REFERENCES users(id),
+  created_at        TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+);
+
+CREATE TABLE IF NOT EXISTS process_recipe_versions (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  recipe_id     INTEGER NOT NULL REFERENCES process_recipes(id),
+  version_no    TEXT NOT NULL,
+  content_json  TEXT NOT NULL,
+  change_reason TEXT NOT NULL,
+  status        TEXT NOT NULL DEFAULT '草稿' CHECK(status IN ('草稿','待审核','已发布','已停用')),
+  created_by    INTEGER REFERENCES users(id),
+  reviewed_by   INTEGER REFERENCES users(id),
+  reviewed_at   TEXT DEFAULT '',
+  created_at    TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+  UNIQUE(recipe_id,version_no)
+);
+
+CREATE TABLE IF NOT EXISTS process_parameter_defs (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  code        TEXT NOT NULL UNIQUE,
+  name        TEXT NOT NULL,
+  stage       TEXT DEFAULT '',
+  value_type  TEXT NOT NULL DEFAULT 'number' CHECK(value_type IN ('number','text')),
+  unit        TEXT DEFAULT '',
+  required    INTEGER NOT NULL DEFAULT 0,
+  active      INTEGER NOT NULL DEFAULT 1,
+  sort        INTEGER NOT NULL DEFAULT 0,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+);
+
+CREATE TABLE IF NOT EXISTS process_runs (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_no            TEXT NOT NULL UNIQUE,
+  recipe_id         INTEGER NOT NULL REFERENCES process_recipes(id),
+  recipe_version_id INTEGER NOT NULL REFERENCES process_recipe_versions(id),
+  batch_id          INTEGER NOT NULL REFERENCES material_batches(id),
+  furnace_batch_id  INTEGER NOT NULL UNIQUE REFERENCES furnace_batches(id),
+  contract_id       INTEGER NOT NULL REFERENCES contracts(id),
+  snapshot_json     TEXT NOT NULL,
+  status            TEXT NOT NULL DEFAULT '草稿' CHECK(status IN ('草稿','待审核','已审核','已作废')),
+  operator_id       INTEGER REFERENCES users(id),
+  reviewer_id       INTEGER REFERENCES users(id),
+  started_at        TEXT DEFAULT '',
+  finished_at       TEXT DEFAULT '',
+  submitted_at      TEXT DEFAULT '',
+  reviewed_at       TEXT DEFAULT '',
+  remark            TEXT DEFAULT '',
+  created_by        INTEGER REFERENCES users(id),
+  created_at        TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+  updated_at        TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+);
+
+CREATE TABLE IF NOT EXISTS process_run_values (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id          INTEGER NOT NULL REFERENCES process_runs(id) ON DELETE CASCADE,
+  parameter_code  TEXT NOT NULL,
+  parameter_name  TEXT NOT NULL,
+  stage           TEXT DEFAULT '',
+  value_type      TEXT NOT NULL CHECK(value_type IN ('number','text')),
+  unit            TEXT DEFAULT '',
+  target_value    TEXT DEFAULT '',
+  min_value       REAL,
+  max_value       REAL,
+  actual_numeric  REAL,
+  actual_text     TEXT DEFAULT '',
+  status          TEXT NOT NULL DEFAULT '缺失' CHECK(status IN ('正常','异常','缺失','估读')),
+  recorded_at     TEXT DEFAULT '',
+  recorded_by     INTEGER REFERENCES users(id),
+  created_at      TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+);
+
+CREATE TABLE IF NOT EXISTS process_events (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id      INTEGER NOT NULL REFERENCES process_runs(id),
+  event_type  TEXT NOT NULL,
+  event_time  TEXT NOT NULL,
+  description TEXT NOT NULL,
+  reason      TEXT DEFAULT '',
+  created_by  INTEGER REFERENCES users(id),
+  created_at  TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+);
+
+CREATE TABLE IF NOT EXISTS process_attachments (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id      INTEGER NOT NULL REFERENCES process_runs(id),
+  filename    TEXT NOT NULL,
+  orig_name   TEXT NOT NULL,
+  size        INTEGER NOT NULL DEFAULT 0,
+  uploaded_by INTEGER REFERENCES users(id),
+  created_at  TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+);
+
+CREATE TABLE IF NOT EXISTS process_improvements (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  code                TEXT NOT NULL UNIQUE,
+  title               TEXT NOT NULL,
+  recipe_id           INTEGER NOT NULL REFERENCES process_recipes(id),
+  problem             TEXT NOT NULL,
+  hypothesis          TEXT DEFAULT '',
+  baseline_run_id     INTEGER REFERENCES process_runs(id),
+  candidate_run_id    INTEGER REFERENCES process_runs(id),
+  result_version_id   INTEGER REFERENCES process_recipe_versions(id),
+  variables_json      TEXT NOT NULL DEFAULT '[]',
+  conclusion          TEXT DEFAULT '',
+  status              TEXT NOT NULL DEFAULT '草稿' CHECK(status IN ('草稿','验证中','已结案','已取消')),
+  is_demo             INTEGER NOT NULL DEFAULT 0,
+  created_by          INTEGER REFERENCES users(id),
+  created_at          TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+  updated_at          TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+  closed_at           TEXT DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS settings (
   key   TEXT PRIMARY KEY,
   value TEXT DEFAULT ''
@@ -357,6 +482,8 @@ CREATE INDEX IF NOT EXISTS idx_furnace_batch ON furnace_batches(batch_id);
 CREATE INDEX IF NOT EXISTS idx_furnace_contract ON furnace_batches(contract_id);
 CREATE INDEX IF NOT EXISTS idx_quality_furnace ON quality_inspections(furnace_batch_id);
 CREATE INDEX IF NOT EXISTS idx_quality_batch ON quality_inspections(batch_id);
+CREATE INDEX IF NOT EXISTS idx_process_versions_recipe ON process_recipe_versions(recipe_id,status);
+CREATE INDEX IF NOT EXISTS idx_process_params_stage ON process_parameter_defs(stage,sort);
 CREATE INDEX IF NOT EXISTS idx_items_contract ON contract_items(contract_id);
 CREATE INDEX IF NOT EXISTS idx_items_ref      ON contract_items(item_type, ref_id);
 CREATE INDEX IF NOT EXISTS idx_files_contract   ON contract_files(contract_id);
@@ -372,3 +499,9 @@ CREATE INDEX IF NOT EXISTS idx_plans_due          ON payment_plans(due_date);
 CREATE INDEX IF NOT EXISTS idx_payments_contract  ON payments(contract_id);
 CREATE INDEX IF NOT EXISTS idx_payments_plan      ON payments(plan_id);
 CREATE INDEX IF NOT EXISTS idx_invoices_contract  ON invoices(contract_id);
+CREATE INDEX IF NOT EXISTS idx_process_runs_contract ON process_runs(contract_id,status);
+CREATE INDEX IF NOT EXISTS idx_process_values_run ON process_run_values(run_id,stage);
+CREATE INDEX IF NOT EXISTS idx_process_events_run ON process_events(run_id,event_time);
+CREATE INDEX IF NOT EXISTS idx_process_attachments_run ON process_attachments(run_id);
+CREATE INDEX IF NOT EXISTS idx_process_improvements_recipe ON process_improvements(recipe_id,status);
+CREATE INDEX IF NOT EXISTS idx_process_improvements_runs ON process_improvements(baseline_run_id,candidate_run_id);

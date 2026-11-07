@@ -9,7 +9,7 @@
 
 ### 1. 安全与业务止损
 
-- 按 admin、finance、manager、sales 实施后端角色权限和合同归属校验。
+- 按 admin、finance、manager、sales、engineer 实施后端角色权限和合同归属校验。
 - 生产环境强制配置 `CRM_SECRET`，新数据库必须通过 `CRM_ADMIN_PASSWORD` 创建管理员，不在日志中输出密码。
 - 防止跨合同期次收款、超收、超开、重复发票、超合同发货和非法数量。
 - 临时发货使用单事务，失败不残留合同；单号使用数据库计数器，删除后不重号。
@@ -44,7 +44,16 @@
 - 客户风险结合未收、逾期、信用额度、停接标记和合同集中度，展示触发原因。
 - 老板移动端提供经营 KPI、逾期、欠款、交付、客户风险、质量和毛利信息。
 
-### 5. 部署与数据修复
+### 5. 工艺知识与批次寻优
+
+- 独立“工艺寻优”模块覆盖配方版本、批次记录、过程监控、对比分析和改进专题。
+- 新增 engineer 工艺工程师角色；已发布配方不可修改，历史执行批次保留完整版本快照。
+- 人工实测区分正常、异常、缺失和估读，支持审核、事件、证据附件和审计。
+- 提供参数趋势、描述性统计、双批次差异、版本对比、标杆候选及改进前后效果。
+- 样本不足时只作描述，不做设备实时控制或自动寻优承诺。
+- 老板移动端提供工艺异常、待审核、久未更新和改进效果摘要。
+
+### 6. 部署与数据修复
 
 - 已在真实服务器完成代码上传、数据库迁移、服务重启和公网验收。
 - 线上服务为 systemd + Gunicorn，健康检查与移动入口可用。
@@ -57,10 +66,12 @@
 ```text
 app.py                  Flask 路由、权限、迁移、业务约束与统计
 finance.py              合同余额和统一财务口径
+process.py              工艺参数与工序校验
 schema.sql              SQLite 表结构、外键、约束与索引
 static/app.js           桌面端合同财务与经营分析
 static/production.js    PVD 生产、质量、对账、成本和设备
-static/mobile.*          老板移动驾驶舱
+static/process.js       工艺配方、批次、监控、分析与改进
+static/mobile.*         老板移动驾驶舱
 static/manifest.webmanifest
 seed_demo.py            完整演示场景灌入，带生产环境保护
 delete_demo.py          演示数据依赖顺序清理，带生产环境保护
@@ -70,8 +81,12 @@ requirements.txt        Flask、Gunicorn、openpyxl
 
 设计和分阶段实施记录位于：
 
-- `docs/superpowers/specs/2026-11-06-pvd-crm-upgrade-design.md`
-- `docs/superpowers/plans/`
+- `DOC/superpowers/specs/2026-11-06-pvd-crm-upgrade-design.md`
+- `DOC/superpowers/plans/`
+- `DOC/process-optimization-design.md`
+- `DOC/process-optimization-plan.md`
+- `DOC/process-glossary.md`
+- `DOC/process-optimization-implementation.md`
 
 ## 本地运行
 
