@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.DS_Store
+*.log
+
+# Business data, attachments and backups never enter source control.
+data/
+backups/
+
+# Local agent/review scratch state.
+.superpowers/
+.hallmark/

@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>登录 - 客户关系管理系统</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body class="login-page">
+<div class="login-card">
+  <div style="text-align:center"><img id="logoImg" src="" alt="" style="display:none;max-height:56px;max-width:180px;margin-bottom:10px"></div>
+  <h1 id="sysName">客户关系管理系统</h1>
+  <p class="login-sub">客户 · 合同 · 回款 · 开票 · 产品 · 服务</p>
+  <form id="loginForm">
+    <label>用户名<input name="username" required autocomplete="username"></label>
+    <label>密码<input name="password" type="password" required autocomplete="current-password"></label>
+    <button type="submit" class="btn btn-primary btn-block">登 录</button>
+    <p class="form-error" id="err"></p>
+  </form>
+</div>
+<script>
+fetch('/api/settings').then(r => r.json()).then(s => {
+  if (s.factory_name) {
+    document.getElementById('sysName').textContent = s.factory_name;
+    document.title = '登录 - ' + s.factory_name;
+  }
+  if (s.logo) {
+    const img = document.getElementById('logoImg');
+    img.src = '/api/settings/logo?t=' + Date.now();
+    img.style.display = '';
+  }
+}).catch(() => {});
+document.getElementById('loginForm').onsubmit = async e => {
+  e.preventDefault();
+  const d = Object.fromEntries(new FormData(e.target));
+  const r = await fetch('/api/login', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(d)
+  });
+  if (r.ok) { location.href = '/'; }
+  else {
+    const j = await r.json().catch(() => ({}));
+    document.getElementById('err').textContent = j.error || '登录失败';
+  }
+};
+</script>
+</body>
+</html>

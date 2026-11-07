@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#171b22">
+  <meta name="description" content="PVD 工厂老板移动经营驾驶舱，查看回款、逾期、开票与交付风险。">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icons/icon-192.png">
+  <link rel="apple-touch-icon" href="/icons/icon-192.png">
+  <link rel="stylesheet" href="/mobile.css">
+  <title>经营驾驶舱</title>
+</head>
+<body>
+  <header class="shell">
+    <div class="shell-inner">
+      <a class="factory" href="/mobile" id="factoryName" aria-label="经营驾驶舱首页">工厂经营</a>
+      <div class="shell-actions">
+        <button class="control" type="button" id="refresh">刷新</button>
+        <button class="control" type="button" id="logout">退出</button>
+      </div>
+    </div>
+  </header>
+  <main class="mobile-main" id="content">
+    <div class="page-head">
+      <div><h1>经营驾驶舱</h1><p class="meta" id="month"></p></div>
+      <span class="mode" id="dataMode">正式数据</span>
+    </div>
+    <div id="status" class="state" role="status">正在读取经营数据…</div>
+    <div id="dashboard" hidden>
+      <dl class="ledger" id="kpis" aria-label="经营核心指标"></dl>
+      <section class="risk-section" aria-labelledby="overdueTitle">
+        <div class="section-head"><h2 id="overdueTitle">逾期应收</h2><span id="overdueCount"></span></div>
+        <ul class="record-list" id="overdue"></ul>
+      </section>
+      <section class="risk-section" aria-labelledby="debtorTitle">
+        <div class="section-head"><h2 id="debtorTitle">欠款客户</h2><span>按未收余额</span></div>
+        <ul class="record-list" id="debtors"></ul>
+      </section>
+      <section class="risk-section" aria-labelledby="deliveryTitle">
+        <div class="section-head"><h2 id="deliveryTitle">交付逾期</h2><span id="deliveryCount"></span></div>
+        <ul class="record-list" id="delivery"></ul>
+      </section>
+      <section class="risk-section" aria-labelledby="customerRiskTitle">
+        <div class="section-head"><h2 id="customerRiskTitle">客户风险</h2><span id="customerRiskCount"></span></div>
+        <ul class="record-list" id="customerRisks"></ul>
+      </section>
+      <p class="footer-note">数据来自当前所选台账，不作为银行余额或法定财务报表。经营分析结果以后端实时查询为准。</p>
+    </div>
+    <noscript><p class="state state--error">请启用 JavaScript 后查看实时经营数据。</p></noscript>
+  </main>
+  <script src="/mobile.js"></script>
+</body>
+</html>

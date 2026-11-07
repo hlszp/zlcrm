@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>客户关系管理系统</title>
+<link rel="stylesheet" href="/style.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+<div id="app" style="display:none">
+  <aside id="sidebar">
+    <div class="logo">
+      <img id="logoImg" src="" alt="" style="display:none">
+      <span id="logoText">客户关系管理系统</span>
+    </div>
+    <nav id="nav">
+      <a href="#/dashboard" data-route="dashboard">📊 仪表盘</a>
+      <a href="#/customers" data-route="customers">👥 客户管理</a>
+      <a href="#/contracts" data-route="contracts">📄 合同管理</a>
+      <a href="#/shipments" data-route="shipments">🚚 发货管理</a>
+      <a href="#/production" data-route="production">🏭 生产协同</a>
+      <a href="#/plans" data-route="plans">💰 回款管理</a>
+      <a href="#/invoices" data-route="invoices">🧾 开票台账</a>
+      <a href="#/products" data-route="products">📦 产品管理</a>
+      <a href="#/services" data-route="services">🛠️ 服务管理</a>
+      <a href="#/reminders" data-route="reminders">🔔 到期提醒 <span id="remindBadge" class="badge" style="display:none"></span></a>
+      <a href="#/analytics" data-route="analytics" id="navAnalytics">📈 数据分析</a>
+      <a href="#/reports" data-route="reports">📊 统计报表</a>
+      <a href="#/settings" data-route="settings" id="navSettings" style="display:none">🏭 系统设置</a>
+      <a href="#/admin" data-route="admin" id="navAdmin" style="display:none">⚙️ 用户管理</a>
+    </nav>
+  </aside>
+  <div id="main">
+    <header id="topbar">
+      <button id="menuBtn" class="btn-icon">☰</button>
+      <span id="pageTitle">仪表盘</span>
+      <span class="spacer"></span>
+      <label id="dataModeWrap" style="display:none">数据范围
+        <select id="dataMode" aria-label="数据范围">
+          <option value="real">正式数据</option>
+          <option value="demo">演示数据</option>
+          <option value="all">全部数据</option>
+        </select>
+      </label>
+      <span id="userInfo"></span>
+      <button class="btn btn-sm" id="btnPwd">改密码</button>
+      <button class="btn btn-sm" id="btnLogout">退出</button>
+    </header>
+    <main id="view"><div class="loading">加载中…</div></main>
+  </div>
+</div>
+<div id="modalRoot"></div>
+<script src="/production.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

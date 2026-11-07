@@ -1,0 +1,15 @@
+{
+  "name": "PVD 工厂经营驾驶舱",
+  "short_name": "经营驾驶舱",
+  "description": "面向工厂老板的合同、回款、逾期和交付风险看板",
+  "start_url": "/mobile",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#171b22",
+  "theme_color": "#171b22",
+  "lang": "zh-CN",
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}
